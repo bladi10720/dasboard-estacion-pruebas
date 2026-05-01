@@ -6,6 +6,7 @@ import re
 import json
 import os
 import glob
+import requests
 from datetime import datetime
 from difflib import get_close_matches
 # CONVERTIR VALORES
@@ -31,7 +32,7 @@ st.markdown("""
 top = st.container()
 with top:
     st.title("⛽ Estación Pro · Dashboard de Ventas y Comisiones")
-    st.caption("Interfaz optimizada tipo empresa (Power BI / Tableau) · Datos desde carpeta `datos/` o carga manual")
+    st.caption("Interfaz optimizada tipo empresa (Power BI / Tableau) · Datos: `datos/`, carga manual, o Google Sheets (URL CSV / secrets)")
     st.divider()
 # =========================================================
 # CONFIGURACIÓN DE COMISIONES (Persistente)
@@ -194,54 +195,208 @@ def exportar_reporte(df):
             top_productos.to_excel(writer, sheet_name='Top Productos')
     
     return output.getvalue()
+COLUMNAS_VENTAS = [
+    'Fecha', 'Hora', 'Cod Producto', 'Descripcion',
+    'Cantidad', 'Valor', 'Nombre Cajero', 'MOP1',
+]
+def _normalizar_df_ventas(df, origen_label=''):
+    """Selecciona columnas de ventas, tipos y fechas. origen_label solo para mensajes de error."""
+    df = df.copy()
+    df.columns = [str(c).strip().replace('\n', ' ') for c in df.columns]
+    cols_presentes = [c for c in COLUMNAS_VENTAS if c in df.columns]
+    if not cols_presentes:
+        msg = 'Columnas no encontradas'
+        return None, (f"{origen_label}: {msg}" if origen_label else msg)
+    df_sel = df[cols_presentes].copy()
+    if 'Fecha' in df_sel.columns:
+        df_sel['Fecha'] = pd.to_datetime(df_sel['Fecha'], dayfirst=True, errors='coerce')
+        df_sel = df_sel.dropna(subset=['Fecha'])
+    for col in ['Cantidad', 'Valor']:
+        if col in df_sel.columns:
+            df_sel[col] = pd.to_numeric(df_sel[col], errors='coerce').fillna(0)
+    for col in ['Nombre Cajero', 'Descripcion']:
+        if col in df_sel.columns:
+            df_sel[col] = df_sel[col].astype(str).fillna('').str.strip()
+    return df_sel, None
+def _obtener_url_sheets_desde_secrets():
+    """URL de exportación CSV (p. ej. SHEETS_CSV_URL en secrets o [sheets] csv_url en TOML)."""
+    try:
+        if 'SHEETS_CSV_URL' in st.secrets:
+            u = str(st.secrets['SHEETS_CSV_URL']).strip()
+            if u:
+                return u
+    except Exception:
+        pass
+    try:
+        sec = st.secrets['sheets']
+        if isinstance(sec, dict) and sec.get('csv_url'):
+            return str(sec['csv_url']).strip()
+    except Exception:
+        pass
+    return ''
+
+def _obtener_url_comisiones_desde_secrets():
+    """URL de exportación CSV para comisiones (COMMISSIONS_CSV_URL / COMISIONES_CSV_URL o [commissions]/[comisiones])."""
+    for k in ('COMMISSIONS_CSV_URL', 'COMISIONES_CSV_URL'):
+        try:
+            if k in st.secrets:
+                u = str(st.secrets[k]).strip()
+                if u:
+                    return u
+        except Exception:
+            pass
+    for sec_name in ('commissions', 'comisiones'):
+        try:
+            sec = st.secrets[sec_name]
+            if isinstance(sec, dict) and sec.get('csv_url'):
+                return str(sec['csv_url']).strip()
+        except Exception:
+            pass
+    return ''
+def cargar_ventas_desde_url_csv(url):
+    """
+    Descarga CSV publicado (Google Sheets: .../export?format=csv&gid=...).
+    Usa User-Agent para evitar respuestas HTML de error en algunos entornos.
+    """
+    url = (url or '').strip()
+    if not url:
+        return None, 'URL vacía'
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; EstacionPro/1.0)'}
+        r = requests.get(url, headers=headers, timeout=45)
+        r.raise_for_status()
+        text = r.content.decode(r.apparent_encoding or 'utf-8', errors='replace')
+    except requests.RequestException as e:
+        return None, f'Error al descargar: {e}'
+    t = text.lstrip()
+    if t.startswith('<') or '<!DOCTYPE' in t[:200].upper():
+        return None, 'La respuesta no parece CSV (¿hoja sin permiso de lectura o URL incorrecta?).'
+    try:
+        df = pd.read_csv(io.StringIO(text))
+    except Exception as e:
+        return None, f'No se pudo leer CSV: {e}'
+    df.columns = [str(c).strip().replace('\n', ' ') for c in df.columns]
+    cols_ok = [c for c in COLUMNAS_VENTAS if c in df.columns]
+    if not cols_ok:
+        try:
+            raw = pd.read_csv(io.StringIO(text), header=None)
+        except Exception:
+            return None, "No se encontró fila de encabezados con columna 'Fecha'."
+        header_row = None
+        for idx in range(min(25, len(raw))):
+            row = raw.iloc[idx]
+            if any('Fecha' in str(v) for v in row.values):
+                header_row = idx
+                break
+        if header_row is None:
+            return None, "No se encontró la fila de encabezados (columna 'Fecha')."
+        df = pd.read_csv(io.StringIO(text), skiprows=header_row)
+    df_sel, err = _normalizar_df_ventas(df, '')
+    if err:
+        return None, err
+    return df_sel, None
+
+def cargar_comisiones_desde_url_csv(url):
+    """
+    Descarga CSV publicado con comisiones. Acepta columnas típicas:
+    - codigo / producto / descripción (cualquiera) + comision
+    - o 2 columnas: (clave, comision)
+    """
+    url = (url or '').strip()
+    if not url:
+        return None, 'URL de comisiones vacía'
+
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; EstacionPro/1.0)'}
+        r = requests.get(url, headers=headers, timeout=45)
+        r.raise_for_status()
+        text = r.content.decode(r.apparent_encoding or 'utf-8', errors='replace')
+    except requests.RequestException as e:
+        return None, f'Error al descargar comisiones: {e}'
+
+    t = text.lstrip()
+    if t.startswith('<') or '<!DOCTYPE' in t[:200].upper():
+        return None, 'La respuesta de comisiones no parece CSV (¿permisos o URL incorrecta?).'
+
+    try:
+        df = pd.read_csv(io.StringIO(text))
+    except Exception as e:
+        return None, f'No se pudo leer CSV de comisiones: {e}'
+
+    df.columns = [str(c).strip().replace('\n', ' ') for c in df.columns]
+    cols_lower = {c: normalizar_texto(c).lower().replace(" ", "") for c in df.columns}
+
+    # Encontrar columna de comisión
+    col_comision = None
+    for c, cl in cols_lower.items():
+        if 'comision' in cl or cl in ('commission', 'commissions'):
+            col_comision = c
+            break
+
+    # Encontrar columna clave (código/nombre/producto)
+    col_key = None
+    for c, cl in cols_lower.items():
+        if c == col_comision:
+            continue
+        if any(k in cl for k in ('cod', 'codigo', 'producto', 'descripcion', 'descripción', 'nombre', 'item')):
+            col_key = c
+            break
+
+    # Si no se detecta por nombre, usar heurística por cantidad de columnas
+    if col_comision is None and len(df.columns) >= 2:
+        # Tomar la última columna como comisión si parece numérica
+        candidata = df.columns[-1]
+        if pd.to_numeric(df[candidata], errors='coerce').notna().any():
+            col_comision = candidata
+    if col_key is None and len(df.columns) >= 2:
+        col_key = df.columns[0]
+
+    if col_key is None or col_comision is None:
+        return None, "No pude identificar columnas de comisiones (necesito una clave y una columna 'comision')."
+
+    comisiones = {}
+    for _, row in df.iterrows():
+        key_raw = row.get(col_key, None)
+        val_raw = row.get(col_comision, None)
+        if pd.isna(key_raw) or key_raw is None:
+            continue
+        try:
+            val = float(pd.to_numeric(val_raw, errors='coerce'))
+        except Exception:
+            continue
+        if pd.isna(val) or val == 0:
+            continue
+        key_norm = normalizar_texto(str(key_raw))
+        if key_norm:
+            comisiones[key_norm] = val
+
+    if not comisiones:
+        return None, 'No se encontraron comisiones válidas en el CSV.'
+
+    return comisiones, None
 def procesar_archivos(lista_archivos):
     """Procesa archivos subidos manualmente"""
-    columnas_posibles = ['Fecha', 'Hora', 'Cod Producto', 'Descripcion', 
-                        'Cantidad', 'Valor', 'Nombre Cajero', 'MOP1']
     lista_df = []
     errores = []
-    
     for arc in lista_archivos:
         try:
-            # Detectar encabezados automáticamente
             df_temp = pd.read_excel(arc, header=None)
             header_row = None
             for idx, row in df_temp.iterrows():
                 if 'Fecha' in str(row.values):
                     header_row = idx
                     break
-            
             if header_row is not None:
                 df = pd.read_excel(arc, skiprows=header_row)
             else:
                 df = pd.read_excel(arc, skiprows=7)
-            
-            df.columns = [str(c).strip().replace('\n', ' ') for c in df.columns]
-            cols_presentes = [c for c in columnas_posibles if c in df.columns]
-            
-            if not cols_presentes:
-                errores.append(f"{arc.name}: Columnas no encontradas")
+            df_sel, err = _normalizar_df_ventas(df, arc.name)
+            if err:
+                errores.append(err)
                 continue
-            
-            df_sel = df[cols_presentes].copy()
-            
-            if 'Fecha' in df_sel.columns:
-                df_sel['Fecha'] = pd.to_datetime(df_sel['Fecha'], dayfirst=True, errors='coerce')
-                df_sel = df_sel.dropna(subset=['Fecha'])
-            
-            for col in ['Cantidad', 'Valor']:
-                if col in df_sel.columns:
-                    df_sel[col] = pd.to_numeric(df_sel[col], errors='coerce').fillna(0)
-            
-            for col in ['Nombre Cajero', 'Descripcion']:
-                if col in df_sel.columns:
-                    df_sel[col] = df_sel[col].astype(str).fillna('').str.strip()
-            
             lista_df.append(df_sel)
-            
         except Exception as e:
             errores.append(f"{arc.name}: {str(e)}")
-    
     if lista_df:
         return pd.concat(lista_df, ignore_index=True), errores
     return None, errores
@@ -250,13 +405,11 @@ def cargar_comisiones_desde_excel():
     
     # Verificar si la carpeta datos existe
     if not os.path.exists("datos"):
-        st.error("❌ La carpeta 'datos/' no existe")
         return {}
     
     # Verificar si COMISION.xlsx está en la carpeta
     ruta = "datos/COMISION.xlsx"
     if not os.path.exists(ruta):
-        st.error("❌ No se encontró el archivo COMISION.xlsx en la carpeta 'datos/'")
         return {}
     
     try:
@@ -312,14 +465,23 @@ def cargar_comisiones_desde_excel():
         st.error(f"❌ Error al leer el archivo: {e}")
         return {}
 def cargar_comisiones():
-    """Carga comisiones SOLO desde Excel"""
-    
+    """Carga comisiones: Google Sheets (CSV) → Excel local (fallback)."""
+    url = _obtener_url_comisiones_desde_secrets()
+    if url:
+        comisiones_url, err = cargar_comisiones_desde_url_csv(url)
+        if comisiones_url:
+            st.success(f"✅ Cargadas {len(comisiones_url)} comisiones desde Google Sheets")
+            return comisiones_url
+        else:
+            st.warning(f"⚠️ No se pudieron cargar comisiones desde Google Sheets: {err}")
+
     comisiones = cargar_comisiones_desde_excel()
-    
-    if not comisiones:
-        st.error("❌ No se pudieron cargar las comisiones. Verifica el archivo COMISION.xlsx")
-    
-    return comisiones
+    if comisiones:
+        st.success(f"✅ Cargadas {len(comisiones)} comisiones desde Excel")
+        return comisiones
+
+    st.warning("⚠️ No hay comisiones cargadas (configura `COMMISSIONS_CSV_URL` o agrega `datos/COMISION.xlsx`).")
+    return {}
 def guardar_comisiones(comisiones):
     """Guarda las comisiones en un archivo JSON"""
     try:
@@ -523,6 +685,10 @@ if 'TABLA_COMISIONES' not in st.session_state:
     st.session_state.TABLA_COMISIONES = cargar_comisiones()
 if 'datos_github' not in st.session_state:
     st.session_state.datos_github = None
+if 'datos_desde_sheets_url' not in st.session_state:
+    st.session_state.datos_desde_sheets_url = False
+if 'sheets_csv_url_input' not in st.session_state:
+    st.session_state.sheets_csv_url_input = _obtener_url_sheets_desde_secrets() or ''
 # Palabras clave para búsqueda flexible
 PALABRAS_CLAVE_COMISIONES = {
     'BIDON': 5000.0,
@@ -555,6 +721,7 @@ with st.expander("📁 Fuente de Datos", expanded=True):
                 df_temp = cargar_desde_github()
                 if df_temp is not None:
                     st.session_state.datos_github = df_temp
+                    st.session_state.datos_desde_sheets_url = False
                     st.success(f"✅ Cargados {len(df_temp)} registros desde `datos/`")
                     st.rerun()
                 else:
@@ -568,6 +735,31 @@ with st.expander("📁 Fuente de Datos", expanded=True):
             accept_multiple_files=True,
             help="Puedes seleccionar uno o varios archivos"
         )
+    st.divider()
+    st.markdown("### Google Sheets (exportación CSV)")
+    st.caption(
+        "Comparte la hoja con «cualquiera con el enlace» como lector (o publica el CSV). "
+        "URL típica: `.../spreadsheets/d/ID/export?format=csv&gid=0` — en repos públicos usa "
+        "`.streamlit/secrets.toml` con la clave `SHEETS_CSV_URL` y no subas ese archivo."
+    )
+    st.text_input(
+        "URL de exportación CSV",
+        key="sheets_csv_url_input",
+        placeholder="https://docs.google.com/spreadsheets/d/.../export?format=csv&gid=0",
+        help="Si rellenas secrets, el primer arranque puede precargar la URL aquí.",
+    )
+    url_secrets = _obtener_url_sheets_desde_secrets()
+    url_efectiva = (st.session_state.get("sheets_csv_url_input") or "").strip() or url_secrets
+    if st.button("Cargar desde Google Sheets (CSV)", use_container_width=True):
+        with st.spinner("Descargando CSV…"):
+            df_url, err_url = cargar_ventas_desde_url_csv(url_efectiva)
+        if df_url is not None:
+            st.session_state.datos_github = df_url
+            st.session_state.datos_desde_sheets_url = True
+            st.success(f"✅ Cargados {len(df_url):,} registros desde Google Sheets")
+            st.rerun()
+        else:
+            st.error(err_url or "No se pudieron cargar los datos")
 # =========================================================
 # SELECCIONAR FUENTE DE DATOS
 # =========================================================
@@ -577,13 +769,17 @@ if archivos_subidos:
         df_base, errores = procesar_archivos(archivos_subidos)
         if df_base is not None:
             st.session_state.datos_github = None
+            st.session_state.datos_desde_sheets_url = False
             st.success(f"✅ Cargados {len(df_base)} registros manualmente")
             if errores:
                 for error in errores[:3]:
                     st.warning(f"⚠️ {error}")
 elif st.session_state.datos_github is not None:
     df_base = st.session_state.datos_github
-    st.info(f"📊 Usando datos de `datos/` ({len(df_base)} registros)")
+    if st.session_state.get("datos_desde_sheets_url"):
+        st.info(f"📊 Usando datos desde **Google Sheets** (URL CSV) — {len(df_base):,} registros")
+    else:
+        st.info(f"📊 Usando datos de `datos/` ({len(df_base):,} registros)")
 # =========================================================
 # PROCESAR Y MOSTRAR DATOS
 # =========================================================
@@ -848,7 +1044,11 @@ if df_base is not None and not df_base.empty:
                     use_container_width=True
                 )
 elif archivos_subidos is None and st.session_state.datos_github is None:
-    st.info("👋 **Bienvenido al Sistema de Gestión de Ventas**\n\nSelecciona archivos Excel o usa 'Cargar desde `datos/`' para comenzar")
+    st.info(
+        "👋 **Bienvenido al Sistema de Gestión de Ventas**\n\n"
+        "Selecciona archivos Excel, usa **Cargar desde `datos/`** o **Google Sheets (CSV)** "
+        "(URL o `SHEETS_CSV_URL` en secrets) para comenzar."
+    )
     
     with st.expander("📖 Guía Rápida"):
         st.markdown("""
@@ -861,6 +1061,7 @@ elif archivos_subidos is None and st.session_state.datos_github is None:
         - ✅ Manejo robusto de errores
         - ✅ Detección flexible de productos
         - ✅ Gestión de comisiones integrada
+        - ✅ Carga desde Google Sheets (URL CSV o `SHEETS_CSV_URL` en secrets)
         """)
 # =========================================================
 # FOOTER
