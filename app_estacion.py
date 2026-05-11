@@ -38,6 +38,26 @@ with top:
 # CONFIGURACIÓN DE COMISIONES (Persistente)
 # =========================================================
 ARCHIVO_COMISIONES = "comisiones_guardadas.json"
+def _dataframe_con_formato(df, formato, **kwargs):
+    """Renderiza un DataFrame con .style.format pero cae a render plano si el Styler/Arrow falla.
+    Esto evita StreamlitAPIException cuando hay tipos mixtos o problemas de serialización Arrow.
+    """
+    if df is None or df.empty:
+        st.dataframe(df, **kwargs)
+        return
+    try:
+        styler = df.style.format(formato, na_rep="")
+        st.dataframe(styler, **kwargs)
+    except Exception:
+        df_show = df.copy()
+        for col, fmt in (formato or {}).items():
+            if col not in df_show.columns:
+                continue
+            serie = pd.to_numeric(df_show[col], errors='coerce')
+            df_show[col] = serie.map(
+                lambda v, _f=fmt: _f.format(v) if pd.notna(v) else ""
+            )
+        st.dataframe(df_show, **kwargs)
 # =========================================================
 # FUNCIONES DE UTILIDAD
 # =========================================================
@@ -296,11 +316,69 @@ def cargar_ventas_desde_url_csv(url):
         return None, err
     return df_sel, None
 
+def _limpiar_encabezado_csv(nombre):
+    s = str(nombre).strip().replace('\n', ' ')
+    if s.startswith('\ufeff'):
+        s = s[1:].strip()
+    return s
+
+
+def _parse_valor_comision_csv(val_raw):
+    """Convierte una celda de comisión a float, tolerando coma decimal, miles y moneda."""
+    if val_raw is None or (isinstance(val_raw, float) and pd.isna(val_raw)):
+        return float('nan')
+    if isinstance(val_raw, bool):
+        return float('nan')
+    if isinstance(val_raw, (int, float)):
+        try:
+            return float(val_raw)
+        except (TypeError, ValueError):
+            return float('nan')
+    s = str(val_raw).strip().replace('$', '').replace(' ', '')
+    if not s or s.lower() in ('nan', 'none', '-', '—'):
+        return float('nan')
+    if ',' in s and '.' in s:
+        s = s.replace('.', '').replace(',', '.')
+    elif ',' in s and '.' not in s:
+        s = s.replace(',', '.')
+    try:
+        v = pd.to_numeric(s, errors='coerce')
+        return float(v) if pd.notna(v) else float('nan')
+    except Exception:
+        return float('nan')
+
+
+def _clave_comision_desde_celda(key_raw):
+    """Normaliza clave (código/nombre) para que '12345.0' del CSV case con '12345' de ventas."""
+    if key_raw is None or (isinstance(key_raw, float) and pd.isna(key_raw)):
+        return ''
+    if isinstance(key_raw, (int, float)) and not isinstance(key_raw, bool):
+        try:
+            f = float(key_raw)
+            if f == int(f):
+                return normalizar_texto(str(int(f)))
+            return normalizar_texto(str(f))
+        except (TypeError, ValueError):
+            pass
+    s = str(key_raw).strip()
+    if not s:
+        return ''
+    if s.replace('.', '', 1).replace('-', '', 1).isdigit():
+        try:
+            f = float(s)
+            if f == int(f):
+                return normalizar_texto(str(int(f)))
+        except ValueError:
+            pass
+    return normalizar_texto(s)
+
+
 def cargar_comisiones_desde_url_csv(url):
     """
     Descarga CSV publicado con comisiones. Acepta columnas típicas:
     - codigo / producto / descripción (cualquiera) + comision
     - o 2 columnas: (clave, comision)
+    Tolera coma decimal, BOM, COMISIÓN con tilde y códigos 12345.0 → 12345.
     """
     url = (url or '').strip()
     if not url:
@@ -319,34 +397,31 @@ def cargar_comisiones_desde_url_csv(url):
         return None, 'La respuesta de comisiones no parece CSV (¿permisos o URL incorrecta?).'
 
     try:
-        df = pd.read_csv(io.StringIO(text))
+        df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
     except Exception as e:
         return None, f'No se pudo leer CSV de comisiones: {e}'
 
-    df.columns = [str(c).strip().replace('\n', ' ') for c in df.columns]
+    df.columns = [_limpiar_encabezado_csv(c) for c in df.columns]
     cols_lower = {c: normalizar_texto(c).lower().replace(" ", "") for c in df.columns}
 
-    # Encontrar columna de comisión
     col_comision = None
     for c, cl in cols_lower.items():
-        if 'comision' in cl or cl in ('commission', 'commissions'):
+        if 'comisi' in cl or 'commission' in cl:
             col_comision = c
             break
 
-    # Encontrar columna clave (código/nombre/producto)
     col_key = None
     for c, cl in cols_lower.items():
         if c == col_comision:
             continue
-        if any(k in cl for k in ('cod', 'codigo', 'producto', 'descripcion', 'descripción', 'nombre', 'item')):
+        if any(k in cl for k in ('cod', 'producto', 'descripcion', 'nombre', 'item')):
             col_key = c
             break
 
-    # Si no se detecta por nombre, usar heurística por cantidad de columnas
     if col_comision is None and len(df.columns) >= 2:
-        # Tomar la última columna como comisión si parece numérica
         candidata = df.columns[-1]
-        if pd.to_numeric(df[candidata], errors='coerce').notna().any():
+        serie = df[candidata].map(_parse_valor_comision_csv)
+        if serie.notna().any():
             col_comision = candidata
     if col_key is None and len(df.columns) >= 2:
         col_key = df.columns[0]
@@ -355,23 +430,28 @@ def cargar_comisiones_desde_url_csv(url):
         return None, "No pude identificar columnas de comisiones (necesito una clave y una columna 'comision')."
 
     comisiones = {}
+    descartadas = 0
     for _, row in df.iterrows():
-        key_raw = row.get(col_key, None)
-        val_raw = row.get(col_comision, None)
-        if pd.isna(key_raw) or key_raw is None:
+        key_raw = row.get(col_key, '')
+        val_raw = row.get(col_comision, '')
+        if key_raw is None or (isinstance(key_raw, str) and key_raw.strip() == ''):
             continue
-        try:
-            val = float(pd.to_numeric(val_raw, errors='coerce'))
-        except Exception:
-            continue
+        val = _parse_valor_comision_csv(val_raw)
         if pd.isna(val) or val == 0:
+            descartadas += 1
             continue
-        key_norm = normalizar_texto(str(key_raw))
+        key_norm = _clave_comision_desde_celda(key_raw)
         if key_norm:
             comisiones[key_norm] = val
 
     if not comisiones:
-        return None, 'No se encontraron comisiones válidas en el CSV.'
+        return (
+            None,
+            'No se encontraron comisiones válidas en el CSV '
+            f"(columnas detectadas: clave='{col_key}', comisión='{col_comision}'; "
+            f"filas descartadas: {descartadas}). "
+            'Revisa que la columna de comisión contenga números (sin texto adicional).'
+        )
 
     return comisiones, None
 def procesar_archivos(lista_archivos):
@@ -990,12 +1070,16 @@ if df_base is not None and not df_base.empty:
                 resumen['% Comisión'] = (resumen['Total Comisiones'] / resumen['Total Ventas'] * 100).round(2)
                 resumen = resumen.sort_values('Total Comisiones', ascending=False)
                 
-                st.dataframe(resumen.style.format({
-                    'Total Comisiones': '${:,.0f}',
-                    'Total Ventas': '${:,.0f}',
-                    'Volumen': '{:,.1f}',
-                    '% Comisión': '{:.2f}%'
-                }), use_container_width=True)
+                _dataframe_con_formato(
+                    resumen,
+                    {
+                        'Total Comisiones': '${:,.0f}',
+                        'Total Ventas': '${:,.0f}',
+                        'Volumen': '{:,.1f}',
+                        '% Comisión': '{:.2f}%',
+                    },
+                    use_container_width=True,
+                )
         
         # Resumen por producto
         with st.expander("📊 Comisiones por Producto"):
@@ -1009,11 +1093,15 @@ if df_base is not None and not df_base.empty:
                 resumen_prod = resumen_prod.sort_values('Pago_Comision', ascending=False)
                 
                 if not resumen_prod.empty:
-                    st.dataframe(resumen_prod.style.format({
-                        'Cantidad': '{:,.1f}',
-                        'Pago_Comision': '${:,.0f}',
-                        'Valor': '${:,.0f}'
-                    }), use_container_width=True)
+                    _dataframe_con_formato(
+                        resumen_prod,
+                        {
+                            'Cantidad': '{:,.1f}',
+                            'Pago_Comision': '${:,.0f}',
+                            'Valor': '${:,.0f}',
+                        },
+                        use_container_width=True,
+                    )
                 else:
                     st.info("No hay comisiones calculadas para los productos filtrados")
         
@@ -1021,14 +1109,15 @@ if df_base is not None and not df_base.empty:
         with st.expander("📋 Detalle de Transacciones"):
             columnas = ['Fecha', 'Hora', 'Nombre Cajero', 'Producto_Info', 'Cantidad', 'Valor', 'Pago_Comision']
             columnas_existentes = [c for c in columnas if c in df_filtrado.columns]
-            st.dataframe(
-                df_filtrado[columnas_existentes].style.format({
+            _dataframe_con_formato(
+                df_filtrado[columnas_existentes],
+                {
                     'Valor': '${:,.0f}',
                     'Pago_Comision': '${:,.0f}',
-                    'Cantidad': '{:,.1f}'
-                }),
+                    'Cantidad': '{:,.1f}',
+                },
                 use_container_width=True,
-                height=400 
+                height=400,
             )
         
         # Exportar
