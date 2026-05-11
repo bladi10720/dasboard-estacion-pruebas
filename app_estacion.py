@@ -273,10 +273,11 @@ def _obtener_url_comisiones_desde_secrets():
         except Exception:
             pass
     return ''
+@st.cache_data(ttl=3600, show_spinner=False)
 def cargar_ventas_desde_url_csv(url):
     """
     Descarga CSV publicado (Google Sheets: .../export?format=csv&gid=...).
-    Usa User-Agent para evitar respuestas HTML de error en algunos entornos.
+    Cache 1h: filtros/clics no re-descargan. Usa el botón "Recargar datos" para forzar.
     """
     url = (url or '').strip()
     if not url:
@@ -373,9 +374,11 @@ def _clave_comision_desde_celda(key_raw):
     return normalizar_texto(s)
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
 def cargar_comisiones_desde_url_csv(url):
     """
-    Descarga CSV publicado con comisiones. Acepta columnas típicas:
+    Descarga CSV publicado con comisiones. Cache 6h: las comisiones casi nunca cambian.
+    Acepta columnas típicas:
     - codigo / producto / descripción (cualquiera) + comision
     - o 2 columnas: (clave, comision)
     Tolera coma decimal, BOM, COMISIÓN con tilde y códigos 12345.0 → 12345.
@@ -822,6 +825,28 @@ with st.expander("📁 Fuente de Datos", expanded=True):
         "URL típica: `.../spreadsheets/d/ID/export?format=csv&gid=0` — en repos públicos usa "
         "`.streamlit/secrets.toml` con la clave `SHEETS_CSV_URL` y no subas ese archivo."
     )
+    st.caption(
+        "ℹ️ Los datos se cachean (ventas: 1 h, comisiones: 6 h) para que filtros y clics no "
+        "vuelvan a descargar todo. Si editaste el Sheet y quieres ver los cambios al instante, "
+        "pulsa **Recargar datos ahora**."
+    )
+    col_recarga_a, col_recarga_b = st.columns([1, 3])
+    with col_recarga_a:
+        if st.button("🔄 Recargar datos ahora", use_container_width=True, help="Limpia la caché y vuelve a leer ventas y comisiones desde Google Sheets."):
+            try:
+                cargar_ventas_desde_url_csv.clear()
+            except Exception:
+                pass
+            try:
+                cargar_comisiones_desde_url_csv.clear()
+            except Exception:
+                pass
+            st.session_state.pop('TABLA_COMISIONES', None)
+            if st.session_state.get('datos_desde_sheets_url'):
+                st.session_state.datos_github = None
+                st.session_state.datos_desde_sheets_url = False
+            st.toast("Caché limpiada. Recargando datos…")
+            st.rerun()
     st.text_input(
         "URL de exportación CSV",
         key="sheets_csv_url_input",
