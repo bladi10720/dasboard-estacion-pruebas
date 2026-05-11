@@ -37,7 +37,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 top = st.container()
 with top:
-    st.title("⛽ Estación Pro · Dashboard de Ventas y Comisiones")
+    st.title("⛽ EDS FILE 048 · Dashboard de Ventas y Comisiones")
     st.caption("Interfaz optimizada tipo empresa (Power BI / Tableau) · Datos: `datos/`, carga manual, o Google Sheets (URL CSV / secrets)")
     st.divider()
 # =========================================================
