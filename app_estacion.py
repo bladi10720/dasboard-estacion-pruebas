@@ -19,7 +19,13 @@ def convertir_a_string(valores):
 # =========================================================
 # CONFIGURACIÓN DE LA PÁGINA
 # =========================================================
-st.set_page_config(page_title="Estación Pro - Reportes", layout="wide", page_icon="⛽")
+if os.path.exists("assets/favicon.png"):
+    _ICONO_PESTANA = "assets/favicon.png"
+elif os.path.exists("assets/eds_logo.png"):
+    _ICONO_PESTANA = "assets/eds_logo.png"
+else:
+    _ICONO_PESTANA = "⛽"
+st.set_page_config(page_title="EDS FILE 048", layout="wide", page_icon=_ICONO_PESTANA)
 st.markdown("""
     <style>
     .main { background-color: #f8f9fa; }
